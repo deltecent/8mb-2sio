@@ -1,4 +1,18 @@
-****************************************************************************
+;---------------------------------------------------------------------------
+;
+; This version is modified to access the 8Mb and standard Altair
+;    drives through an 88-2SIO serial port. The same PC or ESP32 based
+;    disk server that supports the FDC+ can be used as the server for
+;    this version of CP/M (serial serive servers supporting 76.8K or
+;    lower baud rates, such as version 1.4 of the Windows server,
+;    is required).
+;
+;    With Martin Eberhard’s 88-2SIOJP or Patrick Linstruth's 88-2SIOR1
+;    board, the baud rate can be as high as 76.8K baud. At this rate,
+;    performance is the same as an original Altair CP/M versions from
+;    Lifeboat and Burcon running on an actual disk drives.
+;
+;---------------------------------------------------------------------------
 ;
 ; This is a modified version of the Altair CP/M 2.2b BIOS which supports
 ;    8Mb drives on A and B and standard Altair floppy drives on drives
@@ -113,6 +127,11 @@
 ;
 ;--------------------------------------------------------------------------
 ;
+;    1.0    12/06/2024	Patrick Linstruth
+;			First version of the 2SIO Altair Serial Disk CP/M.
+;
+;--------------------------------------------------------------------------
+;
 ;    To patch changes made to this BIOS into a CP/M image saved from
 ;    MOVCPM (e.g., CPMxx.COM), use following commands:
 ;
@@ -135,6 +154,9 @@ NUMTRK8	equ	2048		;number of tracks on 8Mb disk
 NUMSEC	equ	32		;sectors per track
 DATATRK	equ	6		;1st data format track
 SECMASK	equ	1Fh		;five bit sector numbers
+CSECLEN	equ	128		;CP/M sector length
+PSECLEN	equ	137		;physical sector length
+TRKLEN	equ	NUMSEC*PSECLEN
 
 BSH	equ	4		;allocation block shift factor
 BLM	equ	0Fh		;allocation block mask
@@ -241,6 +263,12 @@ SIO2CTL	equ	12h		;2nd port on 2SIO board - control register
 SIO2DAT	equ	13h		;2nd port on 2SIO board - data register
 SIORDRF	equ	01h		;read data register full flag
 SIOTDRE	equ	02h		;transmit data register empty flag
+
+;-----------------------------
+; Set serial server port here
+;-----------------------------
+SRVRCTL	equ	SIO2CTL		;serial port for disk server
+SRVRDAT	equ	SIO2DAT
 
 ;-----------------------------
 ; SIO Serial Board 
@@ -437,7 +465,7 @@ boot	lxi	sp,0100h	;init stack pointer
 	db	CR,LF,LF
 	db	MEMSIZE/10 + '0',MEMSIZE mod 10 + '0'
 	db	'K CP/M 2.2b v1.0',CR,LF
-	db	'For Altair 8Mb Serial Drive',CR,LF,0
+	db	'For Altair 8Mb Drive served through 88-2SIO',CR,LF,0
 				;dispMsg returns with A=0
 	sta	CDISK		;current CPM disk is drive zero
 	sta	coldSt		;no longer in cold start
@@ -687,15 +715,14 @@ secTran	xchg			;HL->translate table
 ;    Clobbers all
 ;----------------------------------------------------------------------------
 read	call	ckFlush		;flush track buffer if needed
-	ei			;re-enable interrupts
 
 	call	readTrk		;fill track buffer if needed
-	ei			;re-enable interrupts
 	jnz	exitDio		;track read error, exit
 	
 	call	movRead		;move sector to (dmaAddr)
 
-exitDio	mvi	a,0		;if zero is true, return zero
+exitDio
+	mvi	a,0		;if zero is true, return zero
 	rz
 
 	inr	a		;else return A<>0, Z false
@@ -721,10 +748,8 @@ exitDio	mvi	a,0		;if zero is true, return zero
 ;    Clobbers all
 ;----------------------------------------------------------------------------
 write	call	ckFlush		;flush track buffer if needed
-	ei			;re-enable interrupts
 
 	call	readTrk		;fill track buffer if needed
-	ei			;re-enable interrupts
 	jnz	exitDio		;track read error, exit
 
 	jmp	movWrt		;move (dmaAddr) to sector and exit
@@ -749,17 +774,13 @@ write	call	ckFlush		;flush track buffer if needed
 movRead	call	altSkew		;secNum to hard sector in A
 	call	dSecAdr		;HL->sector in trkBuf
 	
-	mov	a,m		;A=sector valid flag
-	ora	a
-	rnz			;bad sector, return error
-	
-	lxi	d,DATDATA+1	;DE=offset to data portion of sector
+	lxi	d,DATDATA	;DE=offset to data portion of sector
 	lda	trkNum		;on a data track?
 	ani	07Fh
 	cpi	DATATRK
 	jnc	mrMove		;yes, data track (DE already correct)
 	
-	lxi	d,SYSDATA+1	;DE=offset to data portion of sector
+	lxi	d,SYSDATA	;DE=offset to data portion of sector
 
 mrMove	dad	d		;HL->data portion of sector
 	xchg			;DE->data portion of sector
@@ -792,9 +813,6 @@ mrLoop	ldax	d		;move sector from trkBuf to (dmaAddr)
 movWrt	call	altSkew		;secNum to hard sector in A
 	call	dSecAdr		;HL->sector in trkBuf
 	
-	mvi	m,0		;flag sector as good
-	
-	inx	h		;HL->track
 	lda	trkNum		;A=LSB of track
 	ori	80h		;set sync bit
 	mov	m,a		;set track in sector
@@ -963,95 +981,37 @@ readTrk	lxi	h,bfDrive	;HL->buffered drive number
 rtNew	mvi	a,UNDEF		;invalidate buffered data
 	sta	bfDrive
 	
-	call	dSelDrv		;select drive, load head
-	rnz			;drive select failed, exit with error
-
-	mvi	a,2		;init restore/seek try counter
+	mvi	a,RDTRIES	;init restore/seek try counter
 	sta	skRetry
 	
-rtRtry	call	dSeek		;seek to trkNum (disables interrupts)
-	rnz			;a restore was required and failed
-	
-	call	initTrk		;init all sectors to "bad" (not read)
-	lxi	d,RDTRIES*NUMSEC*256 + NUMSEC
-				;D=max sector reads = RDTRIES revolutions
 				;E=sectors remaining to fill
+rtRtry	lda	drvNum		;A=drive to read
+	lxi	h,trkNum	;BC=track to read
+	mov	c,m
+	inx	h
+	mov	b,m
+	lxi	h,readCmd	;send read command to server
+	call	srvrCmd
 
-; Read sector loop - All sectors are originally marked "bad" (unread) and
-;    a sector counter in E is started at NUMSEC (a full track of sectors).
-;    Sectors are read until sector counter E reaches zero or the total
-;    reads counter in D reaches zero (RDTRIES revolutions). The 1st time
-;    the total reads counter reaches zero, a restore and re-seek is 
-;    performed in case we're on the wrong track. The second time it reaches
-;    zero, the bad sectors remain marked as bad in the track buffer.
+	lxi	h,trkBuf	;receive track data into trkBuf
+	lxi	d,TRKLEN	;length to read
+	call	srvrRcv
+	jnz	rtErr
 
-; Within dRead, 152 cycles execute after the last byte is read until we're
-;    executing the instruction here following the dRead call. An additional
-;    78 cycles are executed here until we're in dNxtSec looking for sector
-;    true. This totals 230 cycles (115us) from the last byte read until
-;    we're hunting for sector true. Allowing for 200us of index alignment
-;    error and 10% speed variance, we have at least 180us to get this done.
-
-; For the Mini Disk, a full track is 16 sectors instead of 32 and the time
-;    available after a sector is read is well over 1000us, so timing is not
-;    an issue.
-
-rdLoop	call	dNxtSec		;(17) wait for next sector, HL->sector buf
-	mov	a,m		;A=sector flag byte
-	ora	a		;this sector already read?
-	jz	rdNext		;yes, skip it
-
-	push	h		;save sector address
-	inx	h		;HL->1st read location in sector
-	call	dRead		;read the sector
-	pop	h		;(10) restore sector address in HL
-	jnz	rdNext		;(10) read error
-
-	xra	a		;(4) set sector flag to zero (good sector)
-	mov	m,a		;(7) 
-
-	dcr	e		;(5) decrement sectors left to fill
-	jz	rtExit		;(10) all sectors read without error
-
-rdNext	dcr	d		;(5) decrement total sectors counter
-	jnz	rdLoop		;(10) go read next sector
-
-	lxi	h,skRetry	;HL->seek retry counter
-	dcr	m		;decrement the counter
-	jz	rtExit		;re-seek(s) done, we're finished
-
-	call	dRestor		;restore to track zero
-	jz	rtRtry		;start over after the re-seek
-
-	ret			;else, exit with error
-
-rtExit	lda	drvNum		;set the buffered drive number
-	sta	bfDrive
+	lda	drvNum		;set the buffered drive number
+	sta	bfDrive	
+	sta	bfDrvSv		;save copy of the drive number
 
 	lhld	trkNum		;set the buffered track number
 	shld	bfTrack
 
 	ret			;exit with Z flag true
 
-;----------------------------------------------------------------------------
-; initTrk - Set the flag byte in each sector in trkBuf to "bad" to
-;    indicate none of the sectors have been read.
-;
-; On Entry
-;
-; On Exit
-;    All sectors in trkBuf marked "bad" (unread)
-;    Clobbers all
-;----------------------------------------------------------------------------
-initTrk	lxi	b,UNDEF*256 + NUMSEC;  B=UNDEF (bad), C=NUMSEC
-	lxi	h,trkBuf	;HL->track buffer
-	lxi	d,TSECLEN	;DE=length of each sector in track buffer
+rtErr	lxi	h,rtryCnt	;else retry
+	dcr	m
+	jnz	rtRtry
 
-itLoop	mov	m,b		;mark sector as bad (not read)
-	dad	d		;HL->next sector in trkBuf
-	dcr	c		;repeat for all sectors
-	jnz	itLoop
-	
+	inr	m		;exit with Z flag false
 	ret
 
 ;----------------------------------------------------------------------------
@@ -1088,80 +1048,58 @@ ckFlush	lda	bfDirty		;see if track buffer is dirty
 	cmp	m		;same track?
 	rz			;yes, no need to flush
 
-wrtTrk	mvi	e,cWRTEN	;E=write command, normal head current
-	mvi	a,42		;tracks 0-42 are normal head current
-	cmp	h		;compare 42 - current track
-	jnc	wrtInit		;track is 0-42, E is correct
-	
-	mvi	e,cWRTEN+cHCSON	;E=write command with reduced current
-	
-wrtInit	xra	a		;clear buffer dirty flag
+wrtTrk	xra	a		;clear buffer dirty flag
 	sta	bfDirty
+	mvi	a,WRTRIES	;init retry counter
+	sta	rtryCnt
 
-	mvi	a,WRTRIES	;initialize write retry count
-	sta	wrRetry
+wtRetry	lda	bfDrvSv		;A=buffered data drive number
+	lxi	h,bfTrack	;BC=buffered data track number
+	mov	c,m
+	inx	h
+	mov	b,m
+	lxi	h,wrtCmd	;send write command to server
+	call	srvrCmd
 
-	di			;disable interrupts
+	lxi	h,cmdResp	;receive write response
+	lxi	d,CMDLEN
+	call	srvrRcv
+	jnz	wtErr		;error	
 
-; rtryWrt - Write track retry entry point. Write a full track starting
-;    with any sector. Don't write sectors that are flagged as bad.
+	lda	cmdResp		;verify 'WRIT' received
+	cpi	'W'
+	jnz	wtErr
+	lda	cmdResp+1
+	cpi	'R'
+	jnz	wtErr
 
-rtryWrt	mvi	d,NUMSEC	;D=count of sectors to write
-	xra	a		;zero the count of sectors actually written
-	sta	secCnt
+	lda	crCode		;A=response code
+	ora	a		;zero = 'OK'
+	jnz	wtErr
 
-wrtLoop	call	dNxtSec		;(78) wait for next sector, HL->sector buf
-	mov	a,m		;(7) check sector flag
-	ora	a		;(4) 
-	jnz	wrtNext		;(10) skip if bad or previously verified
-	
-	mov	a,e		;(5) issue write command to drive
-	out	DRVCMD		;(10) at 114 cycles 57us
-	
-	inx 	h		;point to 1st byte of sector
-	call	dWrite		;write the sector
+	lxi	h,trkBuf	;send track buffer to write	
+	lxi	d,TRKLEN
+	call	srvrSnd
 
-	lxi	h,secCnt	;count number of sectors written	
-	inr	m
+	lxi	h,cmdResp	;receive write response
+	lxi	d,CMDLEN
+	call	srvrRcv
+	jnz	wtErr		;error	
 
-wrtNext	dcr	d		;decrement write sector count
-	jnz	wrtLoop		;loop until all sectors processed
+	lda	cmdResp		;verify 'WSTA' received
+	cpi	'W'
+	jnz	wtErr
+	lda	cmdResp+1
+	cpi	'S'
+	jnz	wtErr
 
-; If the verify flag is set in the mode byte, verify the track just written.
-;    At this point, secCnt has the number of sectors actually written.
+	lda	crCode		;A=response code
+	ora	a		;zero = 'OK'
+	rz
 
-	lda	mode		;verifying writes?
-	ani	fWRTVFY
-	rz			;no, exit
-
-	call	dNxtSec		;force a 1 sector delay for trim erase
-	mvi	d,NUMSEC*VFTRIES   ;D=maximum number of sector reads
-	
-vfyLoop	call	dNxtSec		;wait for next sector, HL->sector buf
-	mov	a,m		;test sector flag, only good and
-	ora	a		;   not previously verified sectors
-	jnz	vfyNext		;   are verified
-		
-	push	h		;save pointer to sector flag
-	inx	h		;point to 1st byte of sector
-	call	dVerify		;verify the sector
-	pop	h		;HL->sector flag for current sector
-	jnz	vfyNext		;didn't match
-	
-	mvi	m,UNDEF		;set flag to indicate sector is verified
-
-	lxi	h,secCnt	;HL->sectors left to verify
-	dcr	m		;decrement the count
-	rz			;track verified, exit
-
-vfyNext	dcr	d		;decrement sector count
-	jnz	vfyLoop		;loop until all verify tries expired
-
-; Read re-tries expired, decrement the write retry count and write again
-
-	lxi	h,wrRetry	;decrement the write retry counter
+wtErr	lxi	h,rtryCnt	;decrement the write retry counter
 	dcr	m
-	jnz	rtryWrt		;retry starting with the write
+	jnz	wtRetry		;retry the write
 
 	call	dispMsg
 	db	CR,LF,'Delayed Write Error', CR, LF, 0
@@ -1193,11 +1131,155 @@ invFlsh	mvi	a,UNDEF		;invalidate track buffer
 	call	ckFlush		;flush the track if needed
 	pop	h
 
-	ei			;restore interrupts
-	mvi	a,cHDUNLD	;unload head
-	out	DRVCMD
 	ret
 	
+;------------------------------------------------------------------------------
+; srvrCmd - Send command pointed to by HL to the serial disk server.
+;    Computes and sends the checksum as well.
+;
+; On Entry:
+;    HL->command string to send
+;    A=Drive number
+;    BC=Track number
+;
+; On Exit:
+;
+; Clobbers all
+;------------------------------------------------------------------------------
+srvrCmd	push	h		;preserve command pointer
+	rlc			;put drive in upper nibble
+	rlc
+	rlc
+	rlc
+	lxi	d,rcDrive-readCmd    ;DE=offset to drive number
+	dad	d
+	ora	b		;track number if lower nibble
+	mov	m,a		;store drive and track number in command
+
+	dcx	h		;move to track number
+	mov	m,c		;store track number in command
+	
+	pop	h		;restore command pointer
+	lxi	d,CMDLEN	;DE=length to send
+				;fall into srvrSnd
+
+;------------------------------------------------------------------------------
+; srvrSnd - Send a data buffer to the serial disk server. Computes and
+;    sends the checksum as well.
+;
+; On Entry:
+;    HL points to the buffer to send
+;    DE contains the length of the buffer
+;
+; On Exit:
+;
+; Clobbers all
+;------------------------------------------------------------------------------
+srvrSnd	lxi	b,0		;BC=checksum
+
+ssLoop	mov	a,m		;A=byte to send
+	add	c		;update checksum LSB
+	mov	c,a		
+	mvi	a,0
+	adc	b		;MSB
+	mov	b,a	
+
+	mov	a,m		;A=byte to send
+	call	ssByte		;server send byte
+	inx	h		;point to next byte
+	dcx	d		;decrement byte count
+	mov	a,d		;all done?
+	ora	e
+	jnz	ssLoop		;loop until zero
+
+; Send checksum (2 bytes)
+
+	mov	a,c		;LSB of checksum
+	call	ssByte
+	mov	a,b		;MSB of checksum
+				;fall into ssByte
+
+;-------------------------------------------------------------------
+; ssByte - Send a single byte from A to the serial disk server
+;-------------------------------------------------------------------
+ssByte	push	psw		;preserve char to send
+	
+ssbLoop	in	SRVRCTL		;loop until OK to send
+	ani	SIOTDRE	
+	jz	ssbLoop
+
+	pop	psw		;A=byte to send
+	out	SRVRDAT
+	ret
+
+;------------------------------------------------------------------------------
+; srvrRcv - Receive a data buffer from the serial disk server. Computes and
+;    verifies the checksum as well.
+;
+; On Entry:
+;    HL points to the buffer to receive
+;    DE contains the length of the buffer
+;
+; On Exit:
+;    Zero true if received without error
+;    Zero false for timeout or checksum error
+; Clobbers all
+;------------------------------------------------------------------------------
+srvrRcv	lxi	b,0		;compute checksum in BC
+
+srLoop	call	srByte		;get a byte
+	rnz			;timeout error
+	mov	m,a		;save byte in the buffer
+
+	add	c		;update checksum
+	mov	c,a
+	mvi	a,0
+	adc	b
+	mov	b,a
+
+	inx	h		;increment buffer pointer
+	dcx	d		;decrement byte counter
+	mov	a,d
+	ora	e
+	jnz	srLoop		;loop until zero
+
+; Receive and compare 16 bit checksum
+
+	call	srByte		;get LSB of checksum
+	rnz			;timeout
+	cmp	c		;match?
+	rnz			;no
+		
+	call	srByte		;get MSB of checksum
+	rnz			;timeout
+	cmp	b		;match?
+	ret			;return with status
+
+;-------------------------------------------------------------------
+; srByte - Receive a byte from the server with 1 second timeout.
+;    Returns zero false for timeout, else true.
+;-------------------------------------------------------------------
+srByte	push	b		;preserve BC
+	lxi	b,41667		;1 second (48 cycles, 24us per loop)
+	
+srbLoop	in	SRVRCTL		;(10)
+	rrc			;(4)
+	jc	srbNew		;(10)
+
+	dcx	b		;(5)
+	mov	a,b		;(5)
+	ora	c		;(4)
+	jnz	srbLoop		;(10)
+
+	pop	b
+	inr	a		;zero false for timeout
+	ret
+
+srbNew	pop	b		;restore BC
+	xra	a		;zero true
+	in	SRVRDAT		;get and return the byte
+	ret
+
 ;------------------------------------------------------------------------------
 ; dispMsg - Display the null-terminated string following the dispMsg call
 ;
@@ -1629,288 +1711,6 @@ serInit	mvi	a,03h		;reset 2SIO ports
 
 	ret
 
-;****************************************************************************
-;
-; Altair disk I/O routines
-;
-;****************************************************************************
-
-;---------------------------------------------------------------------------
-; dSelDrv - Select the drive specified in drvNum and load the head.
-;    Save the track (curTrk) the current drive is on into the track table,
-;    load curTrk for the new drive from the track table.
-;
-; On Entry
-;    drvNum = drive to be selected
-;    curDrv = drive currently selected
-;    selTime = timeout in seconds to wait for drive select
-;    curTrk = track the current drive is on
-;
-; On Exit
-;    Drive selected and head loaded
-;    curDrv = drvNum
-;    curTrk = track the newly selected drive is on
-;    Zero true for success, zero false for error
-;    Clobbers all
-;---------------------------------------------------------------------------
-dSelDrv	lxi	h,curDrv	;HL->currently selected drive
-	mov	e,m		;E=currently selected drive
-
-	lda	drvNum		;A=desired drive
-	mov	c,a		;save new drive in C
-	cmp	e		;same or different drive?
-	jnz	dNewDrv		;different, go select a new drive
-
-	in	DRVSTAT		;drive still selected and enabled?
-	ani	sDSKEN
-	jz	dSelExt		;yes, exit
-
-	jmp	dReSel		;otherwise, re-select the drive
-
-; dNewDrv - Save current track (curTrk) for the current drive to the track
-;    table, load curTrk for the new drive from the track table
-
-dNewDrv	mov	m,c		;save new drive in curDrv
-
-	mov	a,e		;compute index for current drive
-	add	a		;two bytes per entry
-	mov	e,a
-	mvi	d,0		;DE=current drive*2
-
-	lxi	h,trkTbl	;HL->track table
-	dad	d		;HL->trkTbl entry for current drive
-
-	lda	curTrk		;save current track in table
-	mov	m,a		;LSB
-	inx	h
-	lda	curTrk+1	;MSB
-	mov	m,a	
-
-	mov	a,c		;compute index for new drive
-	add	a		;two bytes per entry
-	mov	e,a
-
-	lxi	h,trkTbl	;HL->track table
-	dad	d		;HL->trkTbl for new drive
-
-	mov	a,m		;load new current track from table
-	sta	curTrk		;LSB
-	inx	h
-	mov	a,m		;MSB
-	sta	curTrk+1
-
-; Select the new drive with the timeout specified in selTime
-
-dReSel	lxi	h,selTime	;move select timeout in seconds into B
-	mov	b,m
-
-dSelLp1	lxi	h,25641		;HL=count of 78 cycle loops for 1 second
-
-dSelLp	mvi	a,cDSLCT	;(7) deselect a possibly attached drive
-	out	DRVSLCT		;(10)
-
-	mov	a,c		;(5) A=drive to select
-	out	DRVSLCT		;(10) select it
-
-	in	DRVSTAT		;(10) did drive select work?
-	ani	sDSKEN		;(7)
-	jz	dSelExt		;(5) yes, exit
-
-	dcx	h		;(5) decr 1 sec counter
-	mov	a,h		;(5) test HL counter for zero
-	ora	l		;(4)
-	jnz	dSelLp		;(10) loop for one second
-
-	dcr	b		;decrement seconds expired
-	jnz	dSelLp1		;repeat for a new 1 second
-
-	inr	a		;timeout, return non-zero
-	ret
-
-dSelExt	mvi	a,cHDLOAD	;issue head load command
-	out	DRVCMD		;restarts timeout for mini disk
-  
-	ret			;return with zero status
-
-;---------------------------------------------------------------------------
-; dSeek - Seek to track in trkNum
-;
-; On Entry
-;    Drive selected and ready
-;    trkNum = desired track
-;    curTrk = current track, UNDEF means we don't know
-;
-; On Exit
-;    curTrk = trkNum
-;    Interrupts disabled
-;    Zero true for success, zero false for failure
-;	(failure is a failed restore to track zero)
-;    Clobbers A,B,C,H,L
-;---------------------------------------------------------------------------
-dSeek	di			;disable interrupts
-	lda	curTrk+1	;A=MSB of current track
-	ora	a		;track valid (MSBit not set)
-	jp	dTrkVld		;yes, track is valid
-
-	call	dRestor		;otherwise, restore to track zero
-	rnz			;exit if restore failed
-
-; dTrkVld - Current track is valid, compute direction and number
-;     of steps
-
-dTrkVld	lhld	trkNum		;HL=requested track
-	cmp	h		;current=requested? (MSBs)
-	jnz	dDifTrk		;different track
-
-	lda	curTrk		;compare LSBs
-	cmp	l
-	rz			;already on correct track, exit
-
-dDifTrk	lda	curTrk		;compute DE=current-requested
-	sub	l		;subtract LSBs
-	mov	e,a
-
-	lda	curTrk+1	;subtract MSBs
-	sbb	h
-	mov	d,a
-
-	mvi	b,cSTEPO	;B=step out (assume requested<current)
-	jnc	dDoSeek		;it is
-	
-	mvi	b,cSTEPI	;B=step in (requested>current)
-	xra	a		;compute DE=-DE
-	sub	e
-	mov	e,a
-
-	mvi	a,0		;A=0, don't affect carry
-	sbb	d
-	mov	d,a	
-
-; Save target track in curTrk and then step there
-
-dDoSeek	shld	curTrk		;store new track in curTrk
-	
-	call	dStep		;do the seek
-	xra	a		;return zero
-	ret
-	
-;---------------------------------------------------------------------------
-; dRestor - Restore to track 0 and then delay to ensure any subsequent
-;    seek meets the minimum direction change period.
-;
-; On Entry
-;    Drive selected and ready
-;
-; On Exit
-;    If successful
-;       curTrk = 0
-;	A=0
-;	Zero true
-;    else
-;       curTrk = UNDEF
-;       Zero false
-;    Clobbers all
-;---------------------------------------------------------------------------
-dRestor	lxi	h,0		;set current track to zero
-	shld	curTrk
-
-	in	DRVSTAT		;test for track 0
-	ani	sTRACK0
-	rz			;at track 0, exit
-
-; Step in three tracks, then step out to track 0
-
-	lxi	d,3		;DE=step in 3 tracks
-	mvi	b,cSTEPI	;B=step in command
-	call	dStep		;do 3 steps in
-
-	mvi	a,20		;20ms delay puts us past the 1ms step window
-	call	delayMs		;  and ensures proper dir change delay
-
-; Seek back out until track 0 detected
-
-	lxi	d,NUMTRK8+10	;DE=max steps for 8Mb disk
-	lda	curDrv		;on an 8Mb disk (A or B)?
-	cpi	2
-	jc	drSeek		;yes, step count is correct
-
-	lxi	d,NUMTRK+10	;else, use floppy number of tracsk
-
-drSeek	mvi	b,cSTEPO	;B=step out command
-	call	dStep		;step until track 0 detected
-	jnz	drFail		;restore failed
-
-	mvi	a,20		;20ms delay puts us past the 1ms step window
-	call	delayMs		;  and ensures proper dir change delay	
-	ret			;return with zero
-
-drFail	mvi	a,UNDEF		;restore failed, track is still undefined
-	sta	curTrk+1	;flag is in MSB
-	ret			;return with non-zero
-
-;---------------------------------------------------------------------------
-; dStep - Step head number of steps in HL, direction command in B.
-;   If track zero is detected during a step-out operation, curTrk
-;   is forced to zero and zero is returned in A.
-;
-; On Entry
-;    DE = number of steps > 0
-;    B = step command (cSTEPO or cSTEPI)
-;
-; On Exit
-;    If stepping out and track zero hit
-;	curTrk = 0
-;	A = 0
-;	Zero true
-;    else
-;	Zero false
-;    Clobbers A,B,C,D,E
-;---------------------------------------------------------------------------
-dStep	in	DRVSTAT		;loop until OK to move the head 
-	ani	sMOVEOK
-	jnz	dStep
-
-	in	DRVSTAT		;see if we are at track 0
-	ani	sTRACK0		;at track zero?
-	jnz	dStep1		;no, go on
-
-	mov	a,b		;stepping out?
-	sbi	cSTEPO
-	jz	dStep0		;yes, we've hit track 0
-
-dStep1	mov	a,b		;A=step command and direction
-	out	DRVCMD		;issue the step	
-
-	dcx	d		;decrement step counter
-	mov	a,d		;test for zero
-	ora	e
-	jnz	dStep		;loop until count reaches zero
-
-	inr	e		;force non-zero
-	ret
-
-dStep0	sta	curTrk		;curTrk=0
-	sta	curTrk+1
-	ret			;return with zero true and A=0
-
-;---------------------------------------------------------------------------
-; dNxtSec - Wait for next (any) sector. Returns pointer to the sector
-;    buffer within trkBuf. Control is back to caller at 78 cycles (39us).
-;
-; On Entry
-;    Drive is selected, head loaded
-;
-; On Exit
-;    HL->sector buffer in trkBuf for sector found
-;    Clobbers A,B,C,H,L
-;---------------------------------------------------------------------------
-dNxtSec	in	DRVSEC		;read sector position register
-	rar			;wait for sector true (0=true)
-	jc	dNxtSec
-	
-	ani	SECMASK		;(7) get sector number alone
-				;fall into dSecAdr
-
 ;---------------------------------------------------------------------------
 ; dSecAdr - Convert hard sector in A to address within trkBuf for
 ;    the specified sector
@@ -1933,232 +1733,6 @@ dSecAdr	lxi	h,secAddr  	;(10) HL->sector address table
 	mov	h,m		;(7) H=msb of sector buffer address
 	mov	l,a		;(5) HL->sector buffer
 	ret			;(11)
-
-;----------------------------------------------------------------------------
-; delayMs - Delay for number of ms specified in A 
-;
-; On Entry
-;    A = ms to delay
-;
-; On Exit
-;    A=0
-;    Zero true
-;    Clobbers A,B
-;----------------------------------------------------------------------------
-delayMs	mvi	b,(2000/19)	;19 cycles in the loop below
-
-delayLp	nop			;(4)
-	dcr	b		;(5)
-	jnz	delayLp		;(10)
-
-	dcr	a		;decrement ms counter
-	jnz	delayMs
-	ret
-
-;---------------------------------------------------------------------------
-; dRead - Read a sector, verify checksum, stop byte, and track number.
-;    Verification is done after the sector is read in the time between
-;    the last byte of the sector and before the start of the next sector.
-;    With index alignment and rotation speed tolerance accounted for,
-;    we safely have 360 cycles from the last byte of the sector until code
-;    should be in the sector true hunt loop. The RET is complete from this
-;    routine 152 cycles worst case after the last byte is read.
-;
-; On Entry
-;    Drive is selected, sector true just detected
-;    HL->sector buffer
-;
-; On Exit
-;    Sector read to (HL)
-;    C = track number from disk with sync bit set
-;    Zero true if no error, Zero false for checksum error, missing 
-;	FF stop byte, or track number error
-;    Clobbers A,B,C,H,L
-;---------------------------------------------------------------------------
-dRead	push	h		;(11) save pointer to start of sector
-
-	lxi	b,256+DSECLEN	;(10) B=chksum (-FF), C=bytes to read
-	lda	curTrk		;(13) A=track we're on
-	ani	7Fh		;(7)
-	cpi	DATATRK		;(7) data track or system track?
-	jnc	drSecWt		;(10) data track, length in C is correct
-
-	mvi	c,SSECLEN	;(7) Else, C=length of a system sector
-
-; The sector transfer loop is 116 cycles for two bytes read (has to be
-;     less than 128) and computes checksum over all bytes read. For the
-;     mini disk, only one byte is read per loop iteration.
-
-drSecWt	in	DRVSTAT		;(10) get drive status byte
-	ora	a		;(4) wait for NRDA flag true (zero)
-	jm	drSecWt		;(10) 
-
- 	in	DRVDATA		;(10) read first byte at 24-48 cycles
-	mov	m,a		;(7) store in buffer
-	add	b		;(4) update checksum
-	mov	b,a		;(5) keep checksum in B
-	inx	h		;(5) increment buffer pointer
-	dcr	c		;(5) decrement byte count
-	jz	drSecDn		;(10) exit if done
-
-	in	DRVDATA		;(10) read at 70-94 cycles (data at 64 and 128)
-	mov	m,a		;(7) store in buffer
-	add	b		;(4) update checksum
-	mov	b,a		;(5) keep checksum in B
-	inx	h		;(5) increment buffer pointer
-	dcr	c		;(5) decrement byte count
-	jnz	drSecWt		;(10) repeat until done 
-
-; drSecDn - Sector read is complete, now validate the sector based on whether
-;   it is from a system track or data track.
-
-drSecDn	lda	curTrk		;(10) A=track we're supposed to be on
-	ani	7Fh		;(7)
-	cpi	DATATRK		;(7) system or data track?
-	jnc	drDatTk		;(10) data track
-
-; Validate a system track sector. A system track sector is three bytes
-;    bytes shorter, so this codes starts 3*64 cycles sooner than for a
-;    data sector. This code completes before a data sector would even
-;    finish reading. Therefore, a data sector is the worst timing path.
-
-	mov	a,b		;(5) A=calculated checksum over all bytes
-	dcx	h		;(5) HL->checksum in sector
-	sub	m		;(7) subtract from computed checksum
-	sub	m		;(7) final sum will be zero
-
-	dcx	h		;(5) HL->stop byte
-	mov	b,m		;(7) B=stop byte
-	pop	h		;(10) restore HL->start of buffer
-	inr	b		;(4) was FF stop byte there?
-	rnz			;(5/11) no, return error
-
-	mov	c,m		;(7) C=track number from disk
-	sub	c		;(4) take track out of checksum
-
-	inx	h		;(5) HL->2nd byte of sector
-	sub	m		;(7) take out of checksum
-	
-	inx	h		;(5) HL->3rd byte of sector
-	jmp	drExit		;(10) do common compares and exit
-
-; Validate a data track sector (125 + 27 cycles for sector type jump)
-
-drDatTk	dcx	h		;(5) HL->stop byte
-	mov	a,m		;(7) A=stop byte
-	pop	h		;(10) restore HL->start of buffer
-	inr	a		;(4) was FF stop byte there?
-	rnz			;(5/11) no, return error
-
-	mov	a,b		;(5) A=calculated checksum over all bytes
-	mov	c,m		;(7) C=track number from disk
-	sub	c		;(4) take track out of checksum
-
-	inx	h		;(5) HL->sector number
-	sub	m		;(7) take out of checksum
-	
-	inx	h		;(5) move to checksum byte
-	inx	h		;(5)
-	inx	h		;(5) HL->checksum
-	
-	sub	m		;(7) subtract from checksum
-drExit	sub	m		;(7) checksums match?
-	rnz			;(5/11) no, exit with error
-	
-	lda	curTrk		;(10) A=LSB of track we should be on
-	ori	80h		;(7) set sync bit
-	cmp	c		;(4) same track as from sector?
-	ret			;(11) exit with compare status
-
-;---------------------------------------------------------------------------
-; dVerify - Verify a sector
-;    The 2nd read at 67 cycles only gives 3 cycles of headroom (67-64)
-;    which, in turn, gives about 4% speed tolerance. However, we are
-;    verifying our  own write, so the primary tolerance issue is ISV,
-;    not the average rotation rate, so tolerance is still within the
-;    +/-1.5% ISV spec.
-;
-; On Entry
-;    Drive is selected, sector true just detected
-;    HL->sector buffer to compare against
-;
-; On Exit
-;    Zero true if match, zero false for error
-;    Clobbers A,B,C,H,L
-;---------------------------------------------------------------------------
-dVerify lxi	b,DSECLEN	;(10) B=0, C=data sector length
-	lda	curTrk		;(13) A=track we're on
-	ani	7Fh		;(7)
-	cpi	DATATRK		;(7) data track or system track?
-	jnc	dVfLoop		;(10) data track, length in C is correct
-
-	mvi	c,SSECLEN	;(7) set C=length of a system sector
-
-dVfLoop	in	DRVSTAT		;(10) get drive status byte
-	ora	a		;(4) wait for NRDA flag true (zero)
-	jm	dVfLoop		;(10)
-
- 	in	DRVDATA		;(10) read first byte at 24-48 cycles
-	xra	m		;(4) verify data matches buffer
-	ora	b		;(4) accumulate errors in b
-	mov	b,a		;(5)
-
-	inx	h		;(5) increment buffer pointer
-	dcr	c		;(5) decrement characters remaining counter
-	jz	dVfDone		;(10) done verifying bytes
-
-	in	DRVDATA		;(10) read 2nd byte at 67-91 cycles
-	xra	m		;(4) verify data matches buffer
-	ora	b		;(4) accumlate errors in b
-	mov	b,a		;(5) 
-
-	inx	h		;(5) increment buffer pointer
-	dcr	c		;(5) decrement byte counter
-	jnz	dVfLoop		;(10) loop for all bytes
-
-dVfDone	ora	a		;A=zero if all bytes matched
-	ret			;return status
-
-;---------------------------------------------------------------------------
-; dWrite - Write a sector
-;    The write loop is 61 cycles which gives just 3 cycles (64-61) of 
-;    headroom. However, since the write timing required by the FDC board 
-;    is derived from the 2 MHz CPU/bus clock, this loop is always exactly
-;    in sync with the FDC write timing. 3 cycles of headroom is plenty.
-;
-; On Entry
-;    Drive is selected, sector true just detected, and
-;	the write command has already been issued
-;    HL->sector buffer to write
-;
-; On Exit
-;   Clobbers A,C,H,L
-;---------------------------------------------------------------------------
-dWrite	mvi	c,DSECLEN	;C=number of bytes to write
-	lda	curTrk		;(13) A=track we're on
-	ani	7Fh		;(7)
-	cpi	DATATRK		;(7) data track or system track?
-	jnc	dWrLoop		;(10) data track, length in C is correct
-
-	mvi	c,SSECLEN	;(7) set C=length of a system sector
-
-dWrLoop	in	drvStat		;(10) read drive status register
-	rrc			;(4) wait for ENWD flag (zero)
-	jc	dWrLoop		;(10)
-
-	mov	a,m		;(7) A=next byte to write
-	out	drvData		;(10) write 2nd byte at 68-92 cycles
-	inx	h		;(5) increment buffer pointer
-	dcr	c		;(5) decrement bytes remaining
-	jnz	dWrLoop		;(10) loop until all bytes written
-
-dWrDone	in	drvStat		;wait for another write flag
-	rrc
-	jc	dWrDone
-	
-	xra	a		;write a trailing zero
-	out	drvData
-	ret
 
 ;******************************************************************************
 ;
@@ -2229,6 +1803,17 @@ tranTbl	db	01,09,17,25,03,11,19,27,05,13,21,29,07,15,23,31
 ;----------------------------------------------------------------------------
 ; Initialized data
 ;----------------------------------------------------------------------------
+readCmd	db	'READ'		;read command to server
+rcTrack	db	0		;Param 1 LSB
+rcDrive	db	0		;Param 1 MSB
+rcLen	dw	TRKLEN		;Param 2
+CMDLEN	equ	$-readCmd
+
+wrtCmd	db	'WRIT'		;write command to server
+wcTrack	db	0		;Param 1 LSB
+wcDrive	db	0		;Param 1 MSB
+wcLen	dw	TRKLEN		;Param 2
+
 coldSt	db	0FFh		;FF during cold start, 0 otherwise
 
 curDrv	db	0		;drive number currently selected
@@ -2242,13 +1827,17 @@ bfTrack	db	0,UNDEF		;currently buffered track (MUST follow bfDrive)
 ;----------------------------------------------------------------------------
 ; Non-initialized data
 ;----------------------------------------------------------------------------
+bfDrvSv ds	1		;saved drive number that is currently buffered
 drvNum	ds	1		;drive number from CP/M call
 trkNum	ds	2		;track number from CP/M call (MUST follow drvNum)
 secNum	ds	1		;sector number from CP/M call
 dmaAddr	ds	2		;dma address for disk operations from CP/M call
+rtryCnt ds	1		;disk I/O retry counter
 
-secCnt	ds	1		;count of bad sectors remaining in trkBuf
-wrRetry	ds	1		;write retry counter
+cmdResp ds	4		;server command response buffer
+crCode  ds	2		;response code
+crData  ds	2		;response data
+
 skRetry	ds	1		;restore and seek retry counter
 
 ;-----------------------------------------------------------------------------
